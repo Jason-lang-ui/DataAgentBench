@@ -18,7 +18,7 @@ REGION = (
 REGIONS = re.compile(rf"\b{REGION}\b")
 REGION_LIST = rf"{REGION}(?:(?:\s*,\s*(?:and\s+)?|\s+(?:and|or|&)\s+){REGION})*"
 SUBJECT = re.compile(rf"^({REGION_LIST})\b(.*)$")
-NUMBER = r"\d+(?:,\d{3})*"
+NUMBER = r"(?:[0-9]{1,3}(?:,[0-9]{3})+|[0-9]+)"
 ARTICLES = r"(?:(?:world(?:[ -]category)?|news)\s+)?articles"
 MAXIMUM = (
     rf"(?:the\s+)?(?:most\s+{ARTICLES}|"
@@ -44,18 +44,13 @@ WINNING_PREDICATE = re.compile(
 LOWER_RANK = re.compile(r"\b(?:second|third|fourth|fifth|last|runner[ -]up|lowest|least|fewest)\b")
 UNCERTAIN = re.compile(
     r"\b(?:maybe|perhaps|might|may|could|possibly|probably|unclear|unsure|"
-    r"uncertain|whether|assuming|suppose|if)\b"
+    r"uncertain|whether|assuming|suppose|if|estimated|approximately|roughly)\b"
 )
 NEGATION = re.compile(r"\b(?:not|never|neither|cannot)\b")
 LABEL = re.compile(
     r"^(?:the\s+)?(?:final\s+)?(?:answer|region|winning region|top region|winner)"
     r"\s*(?:is|was|:|=)\s*"
 )
-COUNT_ROW = re.compile(
-    rf"\|?\s*({REGION})\s*(?:\||:|[-–—])\s*({NUMBER})"
-    rf"\s*(?:{ARTICLES})?\s*\|?"
-)
-COUNT_ITEM = re.compile(rf"\b({REGION})\s*(?::|\bat\b)?\s+({NUMBER})\b")
 RANK_ROW = re.compile(r"(\d+)[.)]\s+(.+)")
 COMPARISON = re.compile(
     rf"^(?:has|had|have|{PUBLISH})\s+(more|fewer|less)\s+{ARTICLES}"
@@ -69,20 +64,35 @@ def _names(text):
 
 def _normalize(text):
     text = unicodedata.normalize("NFKC", text).lower()
+    text = "".join(char for char in text if unicodedata.category(char) != "Cf")
     text = text.translate(str.maketrans({"’": "'", "‘": "'", "“": '"', "”": '"'}))
+    text = re.sub(r"[‐‑‒–—−]", "-", text)
+    text = re.sub(r"\b(north|south)[ -]*america\b", r"\1 america", text)
     text = re.sub(r"[*`_]", "", text)
     text = re.sub(r"\b(is|was|are|were|does|do|did|has|have|had)n['’]t\b", r"\1 not", text)
     return text
 
 
-def _in_scope(text):
-    """An explicitly different year/category/metric cannot establish this answer."""
+def _years(text):
     years = set(re.findall(
         r"\b(?:in|for|during|year)\s+(?:the\s+year\s+)?((?:19|20)\d{2})\b", text
     ))
     heading_year = re.match(r"^((?:19|20)\d{2})\s+", text)
     if heading_year:
         years.add(heading_year[1])
+    return years
+
+
+def _mixed_scope(text):
+    years = _years(text)
+    return (("2015" in years and years != {"2015"})
+            or (bool(re.search(r"\bworld\b", text))
+                and bool(re.search(r"\b(?:sports|business|science|technology|population|gdp|height)\b", text))))
+
+
+def _in_scope(text):
+    """An explicitly different year/category/metric cannot establish this answer."""
+    years = _years(text)
     if years and years != {"2015"}:
         return False
     if re.search(r"\b(?:population|countries|gdp|revenue|land area|alphabetically|"
@@ -94,10 +104,18 @@ def _in_scope(text):
 
 
 def _without_comparison(text):
-    return re.split(
+    parts = re.split(
         r"\b(?:followed\s+(?:closely\s+)?by|ahead\s+of|compared\s+(?:to|with)|"
         r"rather\s+than|instead\s+of)\b|,\s*not\b", text, maxsplit=1
-    )[0].rstrip(" ,(")
+    )
+    if len(parts) == 2:
+        # Only discard a plain list of comparison regions (optionally counts).
+        # A trailing assertion or condition must remain visible to the parser.
+        item = rf"{REGION}(?:\s+(?:at|with)\s+{NUMBER}(?:\s+{ARTICLES})?)?"
+        tail = rf"{item}(?:(?:\s*,\s*(?:and\s+)?|\s+and\s+){item})*"
+        if not re.fullmatch(tail, parts[1].strip(" ,().")):
+            return text
+    return parts[0].rstrip(" ,(")
 
 
 def _winner_predicate(text):
@@ -151,18 +169,29 @@ def _prose_claim(clause):
     """Return (winning regions, non-winners, ambiguous) for one assertion."""
     empty = (set(), set(), False)
     clause = clause.strip(" \t\r\"'[]().!")
-    if not clause or "?" in clause:
+    clause = re.sub(r"^(?:and|but|however)\b\s*,?\s*", "", clause)
+    if not clause:
         return empty
+    if "?" in clause:
+        return set(), set(), bool(REGIONS.search(clause) or LABEL.match(clause))
+    # Retractions may refer to an earlier sentence without repeating its region.
+    if clause == "no" or re.search(r"\b(?:retract|withdraw|guess|estimates|"
+                 r"actually\s*,?\s*no|(?:that|this|it|the answer)\s+"
+                 r"(?:is|was)\s+(?:not|incorrect|wrong|false|for)|"
+                 r"(?:however|correction)\s*[:,].*\b(?:this|that|it)\b)", clause):
+        return set(), set(), True
     clause = re.sub(r"^(?:in|for|during)\s+2015\s*[:,]?\s*", "", clause)
     head = _without_comparison(clause)
+    if _mixed_scope(head) and REGIONS.search(head):
+        return set(), set(), True
     if not _in_scope(head):
         return empty
     # An unparsed competing assertion must not silently disappear merely
     # because a different sentence contains an accepted "Answer: Africa".
     potential_rank = bool(
-        (REGIONS.search(head) or re.match(r"^(?:it|this region|that region)\b", head))
-        and re.search(r"\b(?:first|most|largest|highest|greatest|winner|led|"
-                      r"second|third|fewer|more)\b", head)
+        REGIONS.search(head) or LABEL.match(head) or UNCERTAIN.search(head)
+        or re.search(r"\b(?:first|most|largest|highest|greatest|winner|leader|led|tops?|"
+                     r"second|third|fewer|more)\b", head)
     )
     unsupported = (set(), set(), potential_rank)
 
@@ -171,6 +200,9 @@ def _prose_claim(clause):
     body = head[labelled.end():] if labelled else head
     if re.fullmatch(rf"not\s+({REGION_LIST})", body):
         return set(), _names(body), False
+    runner_up = re.fullmatch(rf"(?:the\s+)?runner[ -]up\s+(?:is|was)\s+({REGION})(.*)", body)
+    if runner_up and _answer_tail(runner_up[2]):
+        return set(), _names(runner_up[1]), False
 
     uncertain = bool(UNCERTAIN.search(head))
     body = re.sub(r"^(?:maybe|perhaps|possibly|probably)\s+", "", body)
@@ -198,6 +230,8 @@ def _prose_claim(clause):
     local_predicate = predicate[:next_region.start()] if next_region else predicate
     lower = bool(LOWER_RANK.search(local_predicate))
     if lower and not negative:
+        if re.search(rf"\b{FIRST}\b", local_predicate):
+            return set(), set(), True
         return set(), regions, uncertain or alternatives
 
     positive_predicate = NEGATION.sub("", predicate)
@@ -225,91 +259,237 @@ def _prose_claim(clause):
     return regions, set(), False
 
 
+class _Evidence:
+    """Keep independent observations so no conflicting row can be overwritten."""
+
+    def __init__(self):
+        self.groups = []
+        self.denied = set()
+        self.counts = {}
+        self.ranks = {}
+        self.ambiguous = False
+
+    def number(self, region, value, rank=False):
+        region = " ".join(region.split())
+        if not REGIONS.fullmatch(region) or not re.fullmatch(NUMBER, value):
+            self.ambiguous = True
+            return
+        digits = value.replace(",", "")
+        # Counts in this dataset are small; avoid unbounded integer conversions.
+        if len(digits) > 15:
+            self.ambiguous = True
+            return
+        number = int(digits)
+        if rank and number < 1:
+            self.ambiguous = True
+            return
+        observations = self.ranks if rank else self.counts
+        if region in observations and observations[region] != number:
+            self.ambiguous = True
+        observations[region] = number
+        if rank and number > 1:
+            self.denied.add(region)
+
+    def result(self):
+        first = {region for region, rank in self.ranks.items() if rank == 1}
+        if first:
+            self.groups.append(first)
+        if len(self.counts) > 1:
+            maximum = max(self.counts.values())
+            leaders = {region for region, count in self.counts.items() if count == maximum}
+            # Every member of a claimed tie must agree with observed counts.
+            for group in self.groups:
+                if any(region in self.counts and region not in leaders for region in group):
+                    self.ambiguous = True
+            if not self.groups or "africa" in self.counts:
+                self.groups.append(leaders)
+        common = self.ranks.keys() & self.counts.keys()
+        for left in common:
+            for right in common:
+                rank_delta = self.ranks[left] - self.ranks[right]
+                count_delta = self.counts[left] - self.counts[right]
+                if ((rank_delta == 0 and count_delta != 0)
+                        or (rank_delta != 0 and rank_delta * count_delta >= 0)):
+                    self.ambiguous = True
+        if any(group & self.denied for group in self.groups):
+            return False, "A stated winner is also denied first place."
+        if self.ambiguous:
+            return False, "Uncertain, unsupported or conflicting ranking/count evidence."
+        if not self.groups:
+            return False, "No supported, affirmative first-place answer was found."
+        if not all("africa" in group for group in self.groups):
+            return False, "The answer selects another region above Africa or has conflicting winners."
+        return True, "Africa is selected in first place; explicit ties are allowed."
+
+
+def _count_list(clause, evidence):
+    """Consume an entire count list, never just valid-looking numeric prefixes.
+
+    Return whether this clause has count-list syntax, including malformed lists.
+    Numeric prose is handled separately from explicit first-place assertions.
+    """
+    body = clause.strip(" ()")
+    body = re.sub(r"^(?:and|but|however)\b\s*,?\s*", "", body)
+    if body.endswith("."):
+        body = body[:-1]
+    prefix = re.match(r"^([^:]+):\s*", body)
+    if (prefix and not REGIONS.search(prefix[1])
+            and re.search(r"\b(?:counts?|breakdown|context|results)\b", prefix[1])
+            and not re.search(r"\b(?:most|largest|highest|first|tied)\b", prefix[1])):
+        body = body[prefix.end():]
+    candidate = re.match(rf"^(?:{REGION}\s*(?::|\s+(?:(?:at|had|has)\s+)?[0-9-])|[a-z ]+\s*[:\-]\s*(?:[-0-9]|unknown|nan|n/a))", body)
+    if not candidate:
+        return False
+    item = re.compile(rf"({REGION})\s*(?::\s*|(?:at|had|has)\s+|\s+)({NUMBER})(?:\s+{ARTICLES})?")
+    observations = []
+    while body:
+        match = item.match(body)
+        if not match:
+            evidence.ambiguous = True
+            return True
+        observations.append((match[1], match[2]))
+        body = body[match.end():]
+        if not body:
+            break
+        separator = re.match(r"(?:\s*,\s*(?:and\s+)?|\s+and\s+)", body)
+        if not separator or not body[separator.end():]:
+            evidence.ambiguous = True
+            return True
+        body = body[separator.end():]
+    for region, count in observations:
+        evidence.number(region, count)
+    return True
+
+
+def _table_schema(cells):
+    roles = []
+    for cell in cells:
+        if re.fullmatch(r"regions?", cell):
+            roles.append("region")
+        elif re.fullmatch(r"rank|ranking|position", cell):
+            roles.append("rank")
+        elif re.fullmatch(rf"(?:(?:world(?:[ -]category)?\s+)?(?:article\s+)?counts?|{ARTICLES}|number of {ARTICLES})", cell):
+            roles.append("count")
+        else:
+            roles.append(None)
+    if roles.count("region") == 1 and all(role is not None for role in roles) and len(set(roles)) == len(roles) and len(roles) > 1:
+        return roles
+    return None
+
+
 def validate(llm_output: str):
+    if not isinstance(llm_output, str):
+        return False, "The answer must be text."
     text = _normalize(llm_output)
-    groups, denied, counts, ranked = [], set(), {}, set()
-    count_observations = []
-    ambiguous = False
+    evidence = _Evidence()
+    section_in_scope = True
+    table_roles = None
+    table_active = False
     table_in_scope = True
 
     for line in text.splitlines():
         line = re.sub(r"^\s*(?:[-+•]\s+|#+\s*)", "", line).strip()
         if not line:
-            table_in_scope = True
+            # Blank lines do not cancel an explicit year/category/metric heading.
             continue
-        if not REGIONS.search(line) and (line.endswith(":") or line.startswith("|")):
-            # Table/list headings can specify a different year or metric.
-            if not re.fullmatch(r"[| :\-]+", line):
-                table_in_scope = _heading_in_scope(line)
+        if "|" in line:
+            cells = [cell.strip() for cell in line.strip("|").split("|")]
+            if all(re.fullmatch(r":?-+:?", cell) for cell in cells):
+                continue
+            if any(re.fullmatch(r"regions?", cell) for cell in cells):
+                table_active = True
+                table_roles = _table_schema(cells)
+                table_in_scope = section_in_scope and _in_scope(line)
+                evidence.ambiguous |= _mixed_scope(line)
+                # Unknown metric columns cannot establish article rankings.
+                # A partially recognized ranking table is unsafe to ignore.
+                if table_in_scope and table_roles is None and any(re.search(r"\b(?:rank|articles|count)\b", cell) for cell in cells):
+                    evidence.ambiguous = True
+                continue
+            if table_active:
+                if not table_in_scope or table_roles is None:
+                    continue
+                if len(cells) != len(table_roles):
+                    evidence.ambiguous = True
+                    continue
+                row = dict(zip(table_roles, cells))
+                for role in ("count", "rank"):
+                    if role in row:
+                        evidence.number(row["region"], row[role], rank=role == "rank")
+                continue
+            # A headerless table's column meaning cannot safely be inferred.
+            if section_in_scope:
+                evidence.ambiguous = True
+            continue
+        table_active = False
+        table_roles = None
+        heading = line.endswith(":") or re.search(r"\b(?:counts?|rankings?|population|height)$", line)
+        if not REGIONS.search(line) and heading:
+            evidence.ambiguous |= _mixed_scope(line)
+            section_in_scope = _heading_in_scope(line)
+            continue
+        # A new explicit answer or question-year assertion ends a background
+        # section; an empty line by itself does not.
+        if LABEL.match(line) or (REGIONS.search(line) and _years(line) == {"2015"}):
+            section_in_scope = True
+        if not section_in_scope:
             continue
 
         rank = RANK_ROW.fullmatch(line)
         if rank:
-            if not table_in_scope or not _in_scope(rank[2]):
+            if not _in_scope(rank[2]):
                 continue
             subject = SUBJECT.match(rank[2])
-            if not subject:
-                ambiguous = True
+            if (not subject or UNCERTAIN.search(rank[2]) or NEGATION.search(rank[2])
+                    or re.search(r"\bor\b", rank[2]) or not _answer_tail(subject[2])):
+                evidence.ambiguous = True
                 continue
             regions = _names(subject[1])
-            if UNCERTAIN.search(rank[2]) or re.search(r"\bor\b", subject[1]):
-                ambiguous = True
-            elif NEGATION.search(rank[2]) or LOWER_RANK.search(subject[2]):
-                denied.update(regions)
-            elif not _answer_tail(subject[2]):
-                ambiguous = True
-            elif int(rank[1]) == 1:
-                ranked.update(regions)
-            else:
-                denied.update(regions)
+            tie = re.search(rf"\btied\s+with\s+({REGION_LIST})", subject[2])
+            if tie:
+                regions.update(_names(tie[1]))
+            count = re.search(rf"\b({NUMBER})\s+{ARTICLES}\b", subject[2])
+            for region in regions:
+                evidence.number(region, rank[1], rank=True)
+                if count:
+                    evidence.number(region, count[1])
             continue
 
-        row = COUNT_ROW.fullmatch(line)
-        if row:
-            if table_in_scope:
-                count_observations.append((row[1], row[2]))
-            continue
-        if not table_in_scope:
+        if re.match(r"^[+-]?[0-9]+(?:\.[0-9]+)?[.)]\s+", line):
+            evidence.ambiguous = True
             continue
 
-        # Keep question marks and coordinated region lists intact. A comma is
-        # a clause boundary only before another region with its own predicate.
+        # Keep decimal points and coordinated region lists intact.
         clauses = re.split(
             rf"(?<=[.!?])\s+|;\s*|\b(?:but|whereas|while)\b(?=\s*{REGION}\b)|"
             rf",\s*(?={REGION}\s+(?:had|has|is|was|ranked|published)\b)", line
         )
         for clause in clauses:
-            matches = list(COUNT_ITEM.finditer(clause))
-            prefix = clause[:matches[0].start()].strip() if matches else ""
-            count_list = not prefix or (prefix.endswith(":") and _heading_in_scope(prefix))
-            if len(matches) > 1 and count_list and _in_scope(clause) and table_in_scope:
-                if UNCERTAIN.search(clause) or NEGATION.search(clause) or "?" in clause:
-                    ambiguous = True
-                else:
-                    count_observations.extend((match[1], match[2]) for match in matches)
+            if _in_scope(clause) and _count_list(clause, evidence):
+                continue
             winners, losers, uncertain = _prose_claim(clause)
             if winners:
-                groups.append(winners)
-            denied.update(losers)
-            ambiguous |= uncertain
+                evidence.groups.append(winners)
+                # A count attached to a supported first-place claim also
+                # constrains subsequent rankings and tables (including ties).
+                head = _without_comparison(clause)
+                count = re.search(rf"\b({NUMBER})\s+{ARTICLES}\b", head)
+                if count:
+                    for region in winners:
+                        evidence.number(region, count[1])
+                if head != clause:
+                    for item in re.finditer(rf"({REGION})\s+(?:at|with)\s+({NUMBER})", clause[len(head):]):
+                        evidence.number(item[1], item[2])
+            # Preserve explicit lower-place ties and positions as well as first
+            # place, so their accompanying counts cannot contradict each other.
+            if not uncertain and (winners or losers):
+                ordinal = re.search(r"\b(first|second|third|fourth|fifth|1st|2nd|3rd)\b", clause)
+                if ordinal and not NEGATION.search(clause):
+                    positions = {"first": 1, "1st": 1, "second": 2, "2nd": 2,
+                                 "third": 3, "3rd": 3, "fourth": 4, "fifth": 5}
+                    for region in winners or losers:
+                        evidence.number(region, str(positions[ordinal[1]]), rank=True)
+            evidence.denied.update(losers)
+            evidence.ambiguous |= uncertain
 
-    for region, number in count_observations:
-        region = " ".join(region.split())
-        number = int(number.replace(",", ""))
-        if region in counts and counts[region] != number:
-            return False, "Conflicting article counts for the same region."
-        counts[region] = number
-    if ranked:
-        groups.append(ranked)
-    if len(counts) > 1:
-        maximum = max(counts.values())
-        groups.append({region for region, count in counts.items() if count == maximum})
-    if ambiguous:
-        return False, "The answer contains an uncertain, alternative or unsupported ranking claim."
-    if "africa" in denied:
-        return False, "The answer denies Africa first place or puts another region above it."
-    if not groups:
-        return False, "No supported, affirmative first-place answer was found."
-    if not all("africa" in group for group in groups):
-        return False, "The answer selects another region above Africa or has conflicting winners."
-    return True, "Africa is selected in first place; explicit ties are allowed."
+    return evidence.result()
